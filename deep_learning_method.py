@@ -1,24 +1,29 @@
 # -*- coding: utf-8 -*-
 """
 deep_learning_method.py
-深度学习方法实现猫狗分类：卷积神经网络 CNN（PyTorch 实现，从零训练）。
+深度学习方法实现猫狗分类（PyTorch）。
+
+默认方案：ResNet18 迁移学习（ImageNet 预训练 + 微调）——小数据集标准做法。
+备选方案：从零训练小型 CNN（--model cnn）。
 
 流程：
     1. 使用 torchvision 读取数据，训练集做数据增强（随机裁剪/翻转/旋转/色彩抖动）
-    2. 构建小型 CNN（3 个卷积块 + 全连接层，带 BatchNorm 和 Dropout）
+    2. 加载 ImageNet 预训练 ResNet18，冻结主干，替换分类头并微调最后一层卷积块
     3. 训练若干轮，保存验证集上最优模型
     4. 在测试集上评估，输出准确率、分类报告、混淆矩阵
     5. 绘制训练/验证损失与准确率曲线
 
 运行方式：
-    python deep_learning_method.py
+    python deep_learning_method.py             # 默认 ResNet18 迁移学习
+    python deep_learning_method.py --model cnn # 可选从零训练小型 CNN
 """
 import time
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, models
 import numpy as np
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib
@@ -26,14 +31,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+# 中文字体（Windows）
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+plt.rcParams["axes.unicode_minus"] = False
+
 # ---------- 配置 ----------
 ROOT = Path(r"D:\cxdownload\cat_dog_classifier")
 DATA_DIR = ROOT / "datasets"
 OUTPUT_DIR = ROOT / "output"
 MODEL_PATH = ROOT / "models" / "cnn_model.pth"
-IMG_SIZE = 96
+IMG_SIZE = 224          # 迁移学习用 224x224
 BATCH_SIZE = 16
-EPOCHS = 40
+EPOCHS = 30             # 迁移学习 30 轮足够
 LEARNING_RATE = 1e-3
 SEED = 42
 CLASSES = ["cat", "dog"]
@@ -43,39 +52,40 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
+MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
 
 # ---------- 数据增强与加载 ----------
 def get_transform(augment: bool):
-    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
     if augment:
         return transforms.Compose([
-            transforms.Resize((IMG_SIZE + 16, IMG_SIZE + 16)),
+            transforms.Resize((IMG_SIZE + 32, IMG_SIZE + 32)),
             transforms.RandomResizedCrop(IMG_SIZE, scale=(0.7, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomRotation(degrees=10),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15),
             transforms.ToTensor(),
-            transforms.Normalize(mean, std),
+            transforms.Normalize(MEAN, STD),
         ])
     return transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize(mean, std),
+        transforms.Normalize(MEAN, STD),
     ])
 
 
-# ---------- 网络结构 ----------
+# ---------- 从零训练的小型 CNN（备选） ----------
 class SimpleCNN(nn.Module):
     """小型 CNN：3 个卷积块 + 全局平均池化 + 全连接输出 2 类。"""
     def __init__(self, num_classes=2):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),                                    # 96 -> 48
+            nn.MaxPool2d(2),
             nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),                                    # 48 -> 24
+            nn.MaxPool2d(2),
             nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),                                    # 24 -> 12
+            nn.MaxPool2d(2),
         )
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -86,6 +96,26 @@ class SimpleCNN(nn.Module):
 
     def forward(self, x):
         return self.classifier(self.features(x))
+
+
+def build_model(model_name: str):
+    """构建模型：resnet18=迁移学习；cnn=从零训练。"""
+    if model_name == "resnet18":
+        try:
+            model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        except Exception as e:
+            raise RuntimeError(
+                f"预训练权重下载失败（需要联网）: {e}\n"
+                f"可改用 --model cnn 从零训练，或检查网络后重试。"
+            )
+        # 冻结主干，替换分类头，微调最后一个卷积块
+        for p in model.parameters():
+            p.requires_grad = False
+        model.fc = nn.Linear(model.fc.in_features, 2)
+        for p in model.layer4.parameters():
+            p.requires_grad = True
+        return model
+    return SimpleCNN(num_classes=2)
 
 
 # ---------- 训练 ----------
@@ -121,10 +151,18 @@ def evaluate(model, loader):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=["resnet18", "cnn"], default="resnet18",
+                        help="模型：resnet18=迁移学习（默认），cnn=从零训练小型CNN")
+    parser.add_argument("--epochs", type=int, default=EPOCHS, help="训练轮数")
+    args = parser.parse_args()
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     (ROOT / "models").mkdir(parents=True, exist_ok=True)
     print(f"设备: {DEVICE}")
     t0 = time.time()
+    model_name = args.model
+    print(f"===== 深度学习方法: {model_name} =====")
 
     # 1. 数据加载
     print("1. 加载数据...")
@@ -137,18 +175,24 @@ def main():
     print(f"   训练集: {len(train_ds)}  验证集: {len(val_ds)}  测试集: {len(test_ds)}")
 
     # 2. 构建模型
-    print("2. 构建 CNN 模型...")
-    model = SimpleCNN(num_classes=2).to(DEVICE)
+    print("2. 构建模型...")
+    model = build_model(model_name).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
+    if model_name == "resnet18":
+        # 只优化需要梯度的参数（分类头 + layer4）
+        optimizer = optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=LEARNING_RATE, weight_decay=1e-4)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     print(model)
 
     # 3. 训练
-    print(f"3. 训练 {EPOCHS} 轮...")
+    print(f"3. 训练 {args.epochs} 轮...")
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
     best_acc = 0.0
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, args.epochs + 1):
         tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer)
         va_loss, va_acc = evaluate(model, val_loader)
         scheduler.step()
@@ -161,7 +205,7 @@ def main():
             best_acc = va_acc
             torch.save(model.state_dict(), MODEL_PATH)
         if epoch % 5 == 0 or epoch == 1:
-            print(f"   epoch {epoch:2d}/{EPOCHS} | "
+            print(f"   epoch {epoch:2d}/{args.epochs} | "
                   f"train_loss={tr_loss:.4f} train_acc={tr_acc:.4f} | "
                   f"val_loss={va_loss:.4f} val_acc={va_acc:.4f}")
 
@@ -177,7 +221,7 @@ def main():
             all_labels.extend(y.tolist())
     acc = np.mean(np.array(all_preds) == np.array(all_labels))
 
-    print(f"\n========== 深度学习方法（CNN）测试结果 ==========")
+    print(f"\n========== 深度学习方法（{model_name}）测试结果 ==========")
     print(f"测试集准确率: {acc:.4f} ({acc * 100:.2f}%)")
     print("\n分类报告:")
     print(classification_report(all_labels, all_preds, target_names=CLASSES, digits=4))
