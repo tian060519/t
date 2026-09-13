@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 数据集与模型产物（数据可重新生成，模型体积大不入库）
+datasets/
+models/
+output/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Git
+*.log
+.DS_Store

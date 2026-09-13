@@ -1,0 +1,10 @@
+# 传统方法 + 深度学习方法所需依赖
+numpy
+opencv-python
+scikit-learn
+scikit-image
+pillow
+matplotlib
+joblib
+torch
+torchvision
